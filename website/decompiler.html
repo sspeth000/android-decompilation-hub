@@ -340,14 +340,19 @@
           <circle cx="12" cy="12" r="9"></circle><path d="M12 11v5m0-8h.01"></path>
         </svg>
         <div>
-          <strong>Decompilation is not connected yet</strong>
-          File selection is available in this early build. The processing service still needs to be connected before files can be decompiled.
+          <strong>Runs locally in your browser</strong>
+          The parser reads the DEX structures directly. It creates readable class and method reports plus raw Dalvik code-unit listings. This first engine is an extraction and reconstruction pass, not yet a complete Java decompiler.
         </div>
       </div>
 
       <div class="actions">
-        <span class="privacy-note">Your file stays in this browser for now. It is not uploaded.</span>
-        <button class="start-button" type="button" disabled>Decompilation unavailable</button>
+        <span class="privacy-note">Your file stays on your device. Nothing is uploaded.</span>
+        <button class="start-button" id="decompile-button" type="button" disabled>Analyze and export</button>
+      </div>
+      <div class="results" id="results" aria-live="polite">
+        <strong id="result-title">Ready</strong>
+        <p id="result-description"></p>
+        <div class="progress" id="progress"></div>
       </div>
     </section>
 
@@ -364,13 +369,18 @@
     const fileName = document.getElementById('file-name');
     const fileSize = document.getElementById('file-size');
     const removeButton = document.getElementById('remove-file');
+    const runButton = document.getElementById('decompile-button');
+    const results = document.getElementById('results');
+    const resultTitle = document.getElementById('result-title');
+    const resultDescription = document.getElementById('result-description');
+    const progress = document.getElementById('progress');
+    let selectedFile = null;
 
     function formatSize(bytes) {
       if (bytes < 1024) return bytes + ' B';
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
       return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
     }
-
     function showFile(file) {
       if (!file) return;
       if (!file.name.toLowerCase().endsWith('.dex')) {
@@ -378,45 +388,265 @@
         input.value = '';
         return;
       }
+      selectedFile = file;
       fileName.textContent = file.name;
       fileSize.textContent = formatSize(file.size);
       fileCard.classList.add('visible');
+      runButton.disabled = false;
+      results.classList.remove('visible');
     }
-
     input.addEventListener('change', () => showFile(input.files[0]));
-
     removeButton.addEventListener('click', () => {
       input.value = '';
+      selectedFile = null;
       fileCard.classList.remove('visible');
+      runButton.disabled = true;
+      results.classList.remove('visible');
     });
-
-    ['dragenter', 'dragover'].forEach(type => {
-      dropZone.addEventListener(type, event => {
-        event.preventDefault();
-        dropZone.classList.add('is-over');
-      });
-    });
-
-    ['dragleave', 'drop'].forEach(type => {
-      dropZone.addEventListener(type, event => {
-        event.preventDefault();
-        dropZone.classList.remove('is-over');
-      });
-    });
-
+    ['dragenter', 'dragover'].forEach(type => dropZone.addEventListener(type, event => {
+      event.preventDefault(); dropZone.classList.add('is-over');
+    }));
+    ['dragleave', 'drop'].forEach(type => dropZone.addEventListener(type, event => {
+      event.preventDefault(); dropZone.classList.remove('is-over');
+    }));
     dropZone.addEventListener('drop', event => {
       const file = event.dataTransfer.files[0];
       if (!file) return;
       const transfer = new DataTransfer();
-      transfer.items.add(file);
-      input.files = transfer.files;
-      showFile(file);
+      transfer.items.add(file); input.files = transfer.files; showFile(file);
     });
-
     dropZone.addEventListener('keydown', event => {
       if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        input.click();
+        event.preventDefault(); input.click();
+      }
+    });
+
+    const utf8 = new TextEncoder();
+    const decoder = new TextDecoder('utf-8');
+    function readUleb(view, state) {
+      let value = 0, shift = 0, byte;
+      do {
+        if (state.p >= view.byteLength || shift > 28) throw new Error('Invalid ULEB128 value.');
+        byte = view.getUint8(state.p++);
+        value |= (byte & 0x7f) << shift;
+        shift += 7;
+      } while (byte & 0x80);
+      return value >>> 0;
+    }
+    function readSleb(view, state) {
+      let value = 0, shift = 0, byte;
+      do {
+        if (state.p >= view.byteLength || shift > 28) throw new Error('Invalid SLEB128 value.');
+        byte = view.getUint8(state.p++);
+        value |= (byte & 0x7f) << shift;
+        shift += 7;
+      } while (byte & 0x80);
+      if (shift < 32 && (byte & 0x40)) value |= (~0 << shift);
+      return value | 0;
+    }
+    function parseDex(buffer) {
+      const bytes = new Uint8Array(buffer);
+      const view = new DataView(buffer);
+      const need = (offset, length, label) => {
+        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset + length > view.byteLength)
+          throw new Error('DEX contains an out-of-range ' + label + ' section.');
+      };
+      if (bytes.length < 112 || decoder.decode(bytes.subarray(0, 4)) !== 'dex\n')
+        throw new Error('This file does not have a valid DEX magic header.');
+      const version = decoder.decode(bytes.subarray(4, 7));
+      if (bytes[7] !== 0) throw new Error('Invalid DEX magic terminator.');
+      const u32 = (p) => { need(p, 4, 'header'); return view.getUint32(p, true); };
+      const fileSize = u32(32), headerSize = u32(36), endian = u32(40);
+      if (headerSize !== 112 || fileSize > bytes.length || fileSize < 112)
+        throw new Error('DEX header size or declared file size is invalid.');
+      if (endian !== 0x12345678) throw new Error('Reverse-endian DEX files are not supported in this build.');
+      const table = (sizeAt, offAt, width, label) => {
+        const size = u32(sizeAt), off = u32(offAt);
+        if (size) need(off, size * width, label);
+        return {size, off};
+      };
+      const stringsT = table(56,60,4,'string IDs');
+      const typesT = table(64,68,4,'type IDs');
+      const protosT = table(72,76,12,'prototype IDs');
+      const fieldsT = table(80,84,8,'field IDs');
+      const methodsT = table(88,92,8,'method IDs');
+      const classesT = table(96,100,32,'class definitions');
+      const readString = off => {
+        need(off,1,'string data');
+        const state = {p:off};
+        readUleb(view,state);
+        const start = state.p;
+        while (state.p < bytes.length && bytes[state.p] !== 0) state.p++;
+        need(state.p,1,'string terminator');
+        return decoder.decode(bytes.subarray(start,state.p));
+      };
+      const strings = Array.from({length:stringsT.size},(_,i) => readString(u32(stringsT.off+i*4)));
+      const types = Array.from({length:typesT.size},(_,i) => {
+        const idx = u32(typesT.off+i*4);
+        if (idx >= strings.length) throw new Error('Type references an invalid string.');
+        return strings[idx];
+      });
+      const typeAt = idx => types[idx] ?? ('<bad-type-' + idx + '>');
+      const protoAt = idx => {
+        const p = protosT.off + idx*12;
+        const returnType = typeAt(u32(p+4));
+        const paramsOff = u32(p+8);
+        if (!paramsOff) return returnType + ' ()';
+        need(paramsOff,4,'prototype parameter list');
+        const count = view.getUint32(paramsOff,true);
+        need(paramsOff+4,count*2,'prototype parameter types');
+        const params = [];
+        for (let j=0;j<count;j++) params.push(typeAt(view.getUint16(paramsOff+4+j*2,true)));
+        return returnType + ' (' + params.join(', ') + ')';
+      };
+      const fieldRows = [];
+      for (let i=0;i<fieldsT.size;i++) {
+        const p=fieldsT.off+i*8, cls=view.getUint16(p,true), typ=view.getUint16(p+2,true), name=u32(p+4);
+        fieldRows.push({id:i,owner:typeAt(cls),type:typeAt(typ),name:strings[name] ?? '?'}); 
+      }
+      const methodRows = [];
+      for (let i=0;i<methodsT.size;i++) {
+        const p=methodsT.off+i*8, cls=view.getUint16(p,true), proto=view.getUint16(p+2,true), name=u32(p+4);
+        methodRows.push({id:i,owner:typeAt(cls),name:strings[name] ?? '?',signature:protoAt(proto),codeOffset:0});
+      }
+      const classes = [];
+      const accessNames = [[1,'public'],[2,'private'],[4,'protected'],[8,'static'],[16,'final'],[512,'interface'],[1024,'abstract'],[4096,'synthetic'],[8192,'annotation'],[16384,'enum']];
+      const flags = n => accessNames.filter(([bit]) => (n & bit)!==0).map(x=>x[1]).join(' ') || 'package-private';
+      const classDataDump = [];
+      const codeDump = [];
+      for (let i=0;i<classesT.size;i++) {
+        const p=classesT.off+i*32;
+        const classIdx=u32(p), access=u32(p+4), superIdx=u32(p+8), interfacesOff=u32(p+12);
+        const sourceIdx=u32(p+16), annotationsOff=u32(p+20), classDataOff=u32(p+24), staticValuesOff=u32(p+28);
+        const descriptor=typeAt(classIdx);
+        const classInfo={id:i,descriptor,access:flags(access),superclass:superIdx===0xffffffff?null:typeAt(superIdx),source:sourceIdx===0xffffffff?null:(strings[sourceIdx]??null),interfaces:[],fields:[],methods:[],annotationsOffset:annotationsOff,staticValuesOffset:staticValuesOff};
+        if (interfacesOff) {
+          need(interfacesOff,4,'interface list');
+          const count=view.getUint32(interfacesOff,true); need(interfacesOff+4,count*2,'interface list');
+          for(let j=0;j<count;j++) classInfo.interfaces.push(typeAt(view.getUint16(interfacesOff+4+j*2,true)));
+        }
+        if (classDataOff) {
+          const state={p:classDataOff};
+          const staticFields=readUleb(view,state), instanceFields=readUleb(view,state), directMethods=readUleb(view,state), virtualMethods=readUleb(view,state);
+          let fieldIdx=0;
+          for(let j=0;j<staticFields+instanceFields;j++) {
+            fieldIdx+=readUleb(view,state); const af=readUleb(view,state);
+            const f=fieldRows[fieldIdx]; if(f) classInfo.fields.push({...f,access:flags(af)});
+          }
+          let methodIdx=0;
+          for(let j=0;j<directMethods+virtualMethods;j++) {
+            methodIdx+=readUleb(view,state); const af=readUleb(view,state); const codeOff=readUleb(view,state);
+            const m=methodRows[methodIdx];
+            if(m) {
+              m.codeOffset=codeOff;
+              const item={...m,access:flags(af)};
+              classInfo.methods.push(item);
+              if(codeOff) {
+                need(codeOff,16,'code item');
+                const registers=view.getUint16(codeOff,true), ins=view.getUint32(codeOff+12,true);
+                need(codeOff+16,ins*2,'method instructions');
+                const units=[];
+                for(let k=0;k<ins;k++) units.push(view.getUint16(codeOff+16+k*2,true).toString(16).padStart(4,'0'));
+                codeDump.push('Method: '+m.owner+'->'+m.name+' '+m.signature+'\nRegisters: '+registers+'\nCode units ('+ins+'):\n'+units.map((x,k)=>k.toString().padStart(5,'0')+': '+x).join('\n'));
+              }
+            }
+          }
+        }
+        classes.push(classInfo);
+      }
+      const javaType = d => {
+        const map={'V':'void','Z':'boolean','B':'byte','S':'short','C':'char','I':'int','J':'long','F':'float','D':'double'};
+        if(map[d]) return map[d];
+        if(d.endsWith('[]')) return javaType(d.slice(0,-2))+'[]';
+        if(d[0]==='L'&&d.endsWith(';')) return d.slice(1,-1).replaceAll('/','.');
+        return d;
+      };
+      const javaFiles = [];
+      for(const c of classes) {
+        if(!c.descriptor.startsWith('L')||!c.descriptor.endsWith(';')) continue;
+        const full=c.descriptor.slice(1,-1).replaceAll('/','.');
+        const parts=full.split('.'), name=parts.pop().replace(/[^A-Za-z0-9_$]/g,'_')||'RecoveredClass';
+        const pkg=parts.length?'package '+parts.join('.')+';\n\n':'';
+        const simpleSuper=c.superclass&&c.superclass.startsWith('L')?' extends '+javaType(c.superclass):'';
+        let src=pkg+'// Reconstructed declaration. Method bodies are preserved in bytecode reports.\n';
+        src+=c.access+' class '+name+simpleSuper+' {\n';
+        for(const f of c.fields) src+='    '+f.access+' '+javaType(f.type)+' '+f.name+';\n';
+        for(const m of c.methods) {
+          const sig=m.signature, open=sig.indexOf(' ('), ret=javaType(sig.slice(0,open)), args=sig.slice(open+2,-1);
+          const params=args?args.split(', ').map((t,j)=>javaType(t)+' p'+j).join(', '):'';
+          const methodName=m.name==='<init>'?name:m.name==='<clinit>'?'static':m.name;
+          if(methodName==='static') src+='    static { /* see bytecode report */ }\n';
+          else src+='    '+m.access+' '+ret+' '+methodName+'('+params+') { /* see bytecode report */ }\n';
+        }
+        src+='}\n';
+        javaFiles.push({path:'java/'+parts.concat(name+'.java').join('/'),content:src});
+      }
+      const manifest={
+        format:'DEX',version,fileSize,headerSize,
+        counts:{strings:strings.length,types:types.length,prototypes:protosT.size,fields:fieldRows.length,methods:methodRows.length,classes:classes.length,methodsWithCode:codeDump.length},
+        note:'This initial engine parses DEX tables and class data, reconstructs Java declaration skeletons, and exports raw Dalvik code units. It does not yet translate instruction sequences into Java control flow or recover original source formatting.'
+      };
+      return {manifest,strings,types,protos:Array.from({length:protosT.size},(_,i)=>i+': '+protoAt(i)),fields:fieldRows,methods:methodRows,classes,codeDump,javaFiles};
+    }
+
+    function crc32(bytes) {
+      let crc=0xffffffff;
+      for(const b of bytes) {
+        crc^=b;
+        for(let k=0;k<8;k++) crc=(crc>>>1)^((crc&1)?0xedb88320:0);
+      }
+      return (crc^0xffffffff)>>>0;
+    }
+    function makeZip(files) {
+      const enc=utf8, local=[], central=[]; let offset=0;
+      const u16=(v)=>new Uint8Array([v&255,(v>>>8)&255]);
+      const u32=(v)=>new Uint8Array([v&255,(v>>>8)&255,(v>>>16)&255,(v>>>24)&255]);
+      const join=chunks=>{const n=chunks.reduce((s,a)=>s+a.length,0),out=new Uint8Array(n);let p=0;for(const a of chunks){out.set(a,p);p+=a.length;}return out;};
+      for(const file of files) {
+        const name=enc.encode(file.path), data=typeof file.content==='string'?enc.encode(file.content):file.content, crc=crc32(data);
+        const head=join([u32(0x04034b50),u16(20),u16(0),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u16(name.length),u16(0),name]);
+        local.push(head,data);
+        const c=join([u32(0x02014b50),u16(20),u16(20),u16(0),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u16(name.length),u16(0),u16(0),u16(0),u16(0),u32(0),u32(offset),name]);
+        central.push(c); offset+=head.length+data.length;
+      }
+      const directory=join(central);
+      const end=join([u32(0x06054b50),u16(0),u16(0),u16(files.length),u16(files.length),u32(directory.length),u32(offset),u16(0)]);
+      return new Blob([join(local),directory,end],{type:'application/zip'});
+    }
+    function saveZip(blob,name) {
+      const url=URL.createObjectURL(blob), a=document.createElement('a');
+      a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),1500);
+    }
+    runButton.addEventListener('click', async () => {
+      if(!selectedFile) return;
+      runButton.disabled=true; runButton.textContent='Analyzing…';
+      results.classList.add('visible'); resultTitle.textContent='Reading DEX structures…'; progress.textContent='';
+      try {
+        const parsed=parseDex(await selectedFile.arrayBuffer());
+        const files=[
+          {path:'report/manifest.json',content:JSON.stringify(parsed.manifest,null,2)},
+          {path:'report/classes.json',content:JSON.stringify(parsed.classes,null,2)},
+          {path:'report/methods.json',content:JSON.stringify(parsed.methods,null,2)},
+          {path:'report/fields.json',content:JSON.stringify(parsed.fields,null,2)},
+          {path:'report/types.txt',content:parsed.types.join('\n')},
+          {path:'report/prototypes.txt',content:parsed.protos.join('\n')},
+          {path:'report/strings.txt',content:parsed.strings.map((s,i)=>i+': '+JSON.stringify(s)).join('\n')},
+          {path:'report/dalvik-code-units.txt',content:parsed.codeDump.join('\n\n')||'No method code items were found.'},
+          ...parsed.javaFiles
+        ];
+        const zip=makeZip(files);
+        const base=selectedFile.name.replace(/\.dex$/i,'')||'dex-output';
+        saveZip(zip,base+'-decompiled-report.zip');
+        resultTitle.textContent='Analysis complete';
+        resultDescription.textContent='Parsed '+parsed.manifest.counts.classes+' classes, '+parsed.manifest.counts.methods+' methods and '+parsed.manifest.counts.strings+' strings. Your ZIP export has started.';
+        progress.textContent=parsed.manifest.note;
+      } catch(error) {
+        resultTitle.textContent='Could not parse this DEX';
+        resultDescription.textContent=error instanceof Error?error.message:String(error);
+        progress.textContent='The input may be truncated, malformed, or use a DEX feature not supported by this initial parser.';
+      } finally {
+        runButton.disabled=false; runButton.textContent='Analyze and export';
       }
     });
   </script>
